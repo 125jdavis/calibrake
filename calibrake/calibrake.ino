@@ -2,35 +2,37 @@
  * calibrake.ino
  *
  * Signal interceptor for the Bosch iBooster electronic brake booster.
- * Reads pedal travel sensors S2 (A0, falls with travel) and S4 (A1, rises
- * with travel), applies an EMA filter, maps each to a 0–100 % pedal travel
+ * Reads pedal travel sensors S2 (D2/INT0, falls with travel) and S4
+ * (D3/INT1, rises with travel) as 1 kHz PWM signals using edge-triggered
+ * interrupts, applies an EMA filter, maps each to a 0–100 % pedal travel
  * value using user-supplied calibration end-points, rescales through an
- * 11-entry lookup table, and drives the two channels of an MCP4922 12-bit
- * dual DAC (SPI: D10/SS, D11/MOSI, D13/SCK).  A unity-gain MCP6002 op-amp
- * buffers each DAC output before it reaches the iBooster ECU.
+ * 11-entry lookup table, and drives two 1 kHz PWM outputs on D9 (OC1A,
+ * S2 out) and D10 (OC1B, S4 out) via Timer1.
  *
  * All timing is non-blocking (millis()-based).  No delay() is used.
  *
  * Serial command interface (115200 baud):
  *   E<0-99>        – Set EMA coefficient (0 = unfiltered, 99 = heavy filter)
- *   A<0-1023>      – S2 no-travel  ADC count  (pedal fully released)
- *   B<0-1023>      – S2 full-travel ADC count (pedal fully pressed)
- *   C<0-1023>      – S4 no-travel  ADC count
- *   D<0-1023>      – S4 full-travel ADC count
+ *   A<0-1000>      – S2 no-travel  pulse width µs (pedal fully released)
+ *   B<0-1000>      – S2 full-travel pulse width µs (pedal fully pressed)
+ *   C<0-1000>      – S4 no-travel  pulse width µs
+ *   D<0-1000>      – S4 full-travel pulse width µs
  *   L<0-10>,<0-100>– Set lookup table entry (index, output %)
  *   P              – Print current settings
  */
 
-#include <SPI.h>
-
 // ---------------------------------------------------------------------------
 // Hardware constants
 // ---------------------------------------------------------------------------
-static const uint8_t DAC_SS_PIN = 10; // MCP4922 chip-select (active LOW)
+static const uint8_t S2_PIN     = 2;  // INT0 – S2 PWM input (falls with travel)
+static const uint8_t S4_PIN     = 3;  // INT1 – S4 PWM input (rises with travel)
 
-// MCP4922 channel identifiers
-static const uint8_t DAC_CH_A = 0; // S2 output
-static const uint8_t DAC_CH_B = 1; // S4 output
+static const uint8_t S2_OUT_PIN = 9;  // OC1A – S2 PWM output
+static const uint8_t S4_OUT_PIN = 10; // OC1B – S4 PWM output
+
+// Timer1 ICR1 value for 1 kHz Fast PWM at 16 MHz / prescaler-8:
+//   ICR1 = F_CPU / (prescaler * freq) - 1 = 16 000 000 / (8 * 1000) - 1 = 1999
+static const uint16_t PWM_TOP = 1999;
 
 // ---------------------------------------------------------------------------
 // User-configurable parameters (defaults – overridable via serial)
@@ -40,13 +42,13 @@ static const uint8_t DAC_CH_B = 1; // S4 output
 // Filtered = alpha * raw + (1 - alpha) * filtered,  alpha = (100 - coeff) / 100
 int emaCoefficient = 10;
 
-// S2 (A0) calibration: S2 FALLS as pedal travel increases.
-int s2NoTravel   = 900; // ADC count when pedal is fully released
-int s2FullTravel = 100; // ADC count when pedal is fully pressed
+// S2 calibration pulse widths (µs). S2 FALLS as pedal travel increases.
+int s2NoTravel   = 900; // µs when pedal is fully released
+int s2FullTravel = 100; // µs when pedal is fully pressed
 
-// S4 (A1) calibration: S4 RISES as pedal travel increases.
-int s4NoTravel   = 100; // ADC count when pedal is fully released
-int s4FullTravel = 900; // ADC count when pedal is fully pressed
+// S4 calibration pulse widths (µs). S4 RISES as pedal travel increases.
+int s4NoTravel   = 100; // µs when pedal is fully released
+int s4FullTravel = 900; // µs when pedal is fully pressed
 
 // 11-entry rescaling lookup table.
 // Index i  → input  pedal travel = i * 10 %
@@ -55,40 +57,74 @@ int s4FullTravel = 900; // ADC count when pedal is fully pressed
 int lookupTable[11] = {0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
 
 // ---------------------------------------------------------------------------
+// PWM input state (written by ISRs, read in loop)
+// ---------------------------------------------------------------------------
+volatile uint32_t s2RiseUs  = 0;
+volatile uint16_t s2PulseUs = 500; // last measured pulse width (µs)
+
+volatile uint32_t s4RiseUs  = 0;
+volatile uint16_t s4PulseUs = 500; // last measured pulse width (µs)
+
+// ---------------------------------------------------------------------------
 // Runtime state
 // ---------------------------------------------------------------------------
-float s2Filtered = 512.0f;
-float s4Filtered = 512.0f;
+float s2Filtered = 500.0f;
+float s4Filtered = 500.0f;
 
 unsigned long lastSensorMs = 0;
 unsigned long lastSerialMs = 0;
 
 // ---------------------------------------------------------------------------
-// MCP4922 DAC write
-// channel : DAC_CH_A or DAC_CH_B
-// value   : 12-bit DAC code (0–4095)
-//
-// MCP4922 16-bit command word:
-//   [15]   A/B  channel select  (0 = A, 1 = B)
-//   [14]   BUF  Vref buffer     (0 = unbuffered — external MCP6002 used)
-//   [13]   /GA  output gain     (1 = 1×)
-//   [12]   SHDN shutdown        (1 = active)
-//   [11:0] data
+// ISR for S2 (D2 / INT0) — measures PWM pulse width on each edge.
 // ---------------------------------------------------------------------------
-static void dacWrite(uint8_t channel, uint16_t value)
+void s2ISR()
 {
-    value = constrain(value, 0, 4095);
-
-    uint16_t cmd = 0x3000; // BUF=0, GA=1x, SHDN=active
-    if (channel == DAC_CH_B) {
-        cmd |= 0x8000;     // Channel B
+    if (digitalRead(S2_PIN)) {          // rising edge: record start time
+        s2RiseUs = micros();
+    } else {                            // falling edge: compute pulse width
+        uint32_t pw = micros() - s2RiseUs;
+        if (pw <= 1000UL) {
+            s2PulseUs = (uint16_t)pw;
+        }
     }
-    cmd |= (value & 0x0FFF);
+}
 
-    digitalWrite(DAC_SS_PIN, LOW);
-    SPI.transfer((uint8_t)(cmd >> 8));
-    SPI.transfer((uint8_t)(cmd & 0xFF));
-    digitalWrite(DAC_SS_PIN, HIGH);
+// ---------------------------------------------------------------------------
+// ISR for S4 (D3 / INT1) — measures PWM pulse width on each edge.
+// ---------------------------------------------------------------------------
+void s4ISR()
+{
+    if (digitalRead(S4_PIN)) {          // rising edge: record start time
+        s4RiseUs = micros();
+    } else {                            // falling edge: compute pulse width
+        uint32_t pw = micros() - s4RiseUs;
+        if (pw <= 1000UL) {
+            s4PulseUs = (uint16_t)pw;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Map an output travel % to a Timer1 OCR value for S2.
+// S2 falls with travel: 0 % → s2NoTravel µs, 100 % → s2FullTravel µs.
+// 1 timer tick = 0.5 µs at 16 MHz / prescaler-8, so OCR = pw_us * 2.
+// ---------------------------------------------------------------------------
+static uint16_t travelToS2Ocr(int travel)
+{
+    long pw = map(travel, 0, 100, s2NoTravel, s2FullTravel);
+    pw = constrain(pw, 0, 1000);
+    return (uint16_t)constrain(pw * 2L, 0L, (long)PWM_TOP);
+}
+
+// ---------------------------------------------------------------------------
+// Map an output travel % to a Timer1 OCR value for S4.
+// S4 rises with travel: 0 % → s4NoTravel µs, 100 % → s4FullTravel µs.
+// ---------------------------------------------------------------------------
+static uint16_t travelToS4Ocr(int travel)
+{
+    long pw = map(travel, 0, 100, s4NoTravel, s4FullTravel);
+    pw = constrain(pw, 0, 1000);
+    return (uint16_t)constrain(pw * 2L, 0L, (long)PWM_TOP);
 }
 
 // ---------------------------------------------------------------------------
@@ -110,30 +146,6 @@ static int lookupInterpolate(int input)
     // Linear interpolation between table[idx] and table[idx+1]
     return lookupTable[idx]
            + (lookupTable[idx + 1] - lookupTable[idx]) * rem / 10;
-}
-
-// ---------------------------------------------------------------------------
-// Map an output travel % to a 12-bit DAC code for S2.
-// S2 falls with travel: 0 % travel → s2NoTravel voltage,
-//                      100 % travel → s2FullTravel voltage.
-// ---------------------------------------------------------------------------
-static uint16_t travelToS2Dac(int travel)
-{
-    long adcVal = map(travel, 0, 100, s2NoTravel, s2FullTravel);
-    adcVal = constrain(adcVal, 0, 1023);
-    return (uint16_t)((adcVal * 4095L) / 1023L);
-}
-
-// ---------------------------------------------------------------------------
-// Map an output travel % to a 12-bit DAC code for S4.
-// S4 rises with travel: 0 % travel → s4NoTravel voltage,
-//                      100 % travel → s4FullTravel voltage.
-// ---------------------------------------------------------------------------
-static uint16_t travelToS4Dac(int travel)
-{
-    long adcVal = map(travel, 0, 100, s4NoTravel, s4FullTravel);
-    adcVal = constrain(adcVal, 0, 1023);
-    return (uint16_t)((adcVal * 4095L) / 1023L);
 }
 
 // ---------------------------------------------------------------------------
@@ -161,29 +173,29 @@ static void processSerial()
     }
     case 'A': {
         int val = Serial.parseInt();
-        s2NoTravel = constrain(val, 0, 1023);
-        Serial.print(F("S2 no-travel ADC: "));
+        s2NoTravel = constrain(val, 0, 1000);
+        Serial.print(F("S2 no-travel us: "));
         Serial.println(s2NoTravel);
         break;
     }
     case 'B': {
         int val = Serial.parseInt();
-        s2FullTravel = constrain(val, 0, 1023);
-        Serial.print(F("S2 full-travel ADC: "));
+        s2FullTravel = constrain(val, 0, 1000);
+        Serial.print(F("S2 full-travel us: "));
         Serial.println(s2FullTravel);
         break;
     }
     case 'C': {
         int val = Serial.parseInt();
-        s4NoTravel = constrain(val, 0, 1023);
-        Serial.print(F("S4 no-travel ADC: "));
+        s4NoTravel = constrain(val, 0, 1000);
+        Serial.print(F("S4 no-travel us: "));
         Serial.println(s4NoTravel);
         break;
     }
     case 'D': {
         int val = Serial.parseInt();
-        s4FullTravel = constrain(val, 0, 1023);
-        Serial.print(F("S4 full-travel ADC: "));
+        s4FullTravel = constrain(val, 0, 1000);
+        Serial.print(F("S4 full-travel us: "));
         Serial.println(s4FullTravel);
         break;
     }
@@ -208,10 +220,10 @@ static void processSerial()
     case 'P': {
         Serial.println(F("=== calibrake settings ==="));
         Serial.print(F("EMA coefficient : ")); Serial.println(emaCoefficient);
-        Serial.print(F("S2 no-travel    : ")); Serial.println(s2NoTravel);
-        Serial.print(F("S2 full-travel  : ")); Serial.println(s2FullTravel);
-        Serial.print(F("S4 no-travel    : ")); Serial.println(s4NoTravel);
-        Serial.print(F("S4 full-travel  : ")); Serial.println(s4FullTravel);
+        Serial.print(F("S2 no-travel us : ")); Serial.println(s2NoTravel);
+        Serial.print(F("S2 full-travel us: ")); Serial.println(s2FullTravel);
+        Serial.print(F("S4 no-travel us : ")); Serial.println(s4NoTravel);
+        Serial.print(F("S4 full-travel us: ")); Serial.println(s4FullTravel);
         Serial.print(F("LUT             : "));
         for (int i = 0; i <= 10; i++) {
             Serial.print(lookupTable[i]);
@@ -235,26 +247,36 @@ void setup()
 {
     Serial.begin(115200);
 
-    // MCP4922 SPI chip-select — idle HIGH
-    pinMode(DAC_SS_PIN, OUTPUT);
-    digitalWrite(DAC_SS_PIN, HIGH);
+    // PWM input pins — pull-ups guard against floating during power-up.
+    pinMode(S2_PIN, INPUT_PULLUP);
+    pinMode(S4_PIN, INPUT_PULLUP);
 
-    // SPI: MCP4922 supports up to 20 MHz; 4 MHz is conservative and safe.
-    SPI.begin();
-    SPI.beginTransaction(SPISettings(4000000UL, MSBFIRST, SPI_MODE0));
+    // Seed EMA with no-travel calibration values before interrupts start.
+    s2Filtered = (float)s2NoTravel;
+    s4Filtered = (float)s4NoTravel;
+
+    // Attach interrupts on both edges to measure pulse width.
+    attachInterrupt(digitalPinToInterrupt(S2_PIN), s2ISR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(S4_PIN), s4ISR, CHANGE);
+
+    // Configure Timer1 for 1 kHz Fast PWM on OC1A (D9) and OC1B (D10).
+    //   Fast PWM, ICR1 as TOP: WGM13:10 = 1110
+    //   Non-inverting output on OC1A and OC1B: COM1A1=1, COM1B1=1
+    //   Prescaler 8: CS11=1
+    pinMode(S2_OUT_PIN, OUTPUT);
+    pinMode(S4_OUT_PIN, OUTPUT);
+    TCCR1A = (1 << COM1A1) | (1 << COM1B1) | (1 << WGM11);
+    TCCR1B = (1 << WGM13)  | (1 << WGM12)  | (1 << CS11);
+    ICR1   = PWM_TOP;
+
+    // Drive outputs to the no-travel position at power-on.
+    OCR1A = travelToS2Ocr(0);
+    OCR1B = travelToS4Ocr(0);
 
     // Reduce Serial.parseInt() timeout so each parseInt() call blocks the loop
     // for at most 20 ms instead of the default 1000 ms.  Commands that call
     // parseInt() twice (e.g. 'L') may block up to ~40 ms total.
     Serial.setTimeout(20);
-
-    // Seed EMA filters with the current sensor readings
-    s2Filtered = (float)analogRead(A0);
-    s4Filtered = (float)analogRead(A1);
-
-    // Drive DAC outputs to the no-travel position at power-on
-    dacWrite(DAC_CH_A, travelToS2Dac(0));
-    dacWrite(DAC_CH_B, travelToS4Dac(0));
 
     Serial.println(F("calibrake ready"));
     Serial.println(F("Commands: E<ema> A<s2no> B<s2full> C<s4no> D<s4full> L<idx>,<val> P"));
@@ -270,13 +292,16 @@ void loop()
     // -- Non-blocking serial command handling --------------------------------
     processSerial();
 
-    // -- 1 ms: read sensors and update DAC outputs ---------------------------
+    // -- 1 ms: read sensors and update PWM outputs ---------------------------
     // Unsigned subtraction handles millis() wrap-around correctly (~50-day rollover).
     if (now - lastSensorMs >= 1UL) {
         lastSensorMs = now;
 
-        int s2Raw = analogRead(A0);
-        int s4Raw = analogRead(A1);
+        // Safely snapshot latest ISR-measured pulse widths.
+        noInterrupts();
+        uint16_t s2Raw = s2PulseUs;
+        uint16_t s4Raw = s4PulseUs;
+        interrupts();
 
         // EMA: alpha = (100 - coeff) / 100
         //   coeff = 0  → alpha = 1.0  → output == input  (no filtering)
@@ -285,7 +310,7 @@ void loop()
         s2Filtered = alpha * (float)s2Raw + (1.0f - alpha) * s2Filtered;
         s4Filtered = alpha * (float)s4Raw + (1.0f - alpha) * s4Filtered;
 
-        // Map filtered ADC values to 0–100 % pedal travel
+        // Map filtered pulse widths to 0–100 % pedal travel
         int s2Travel = constrain(
             map((int)s2Filtered, s2NoTravel, s2FullTravel, 0, 100), 0, 100);
         int s4Travel = constrain(
@@ -295,17 +320,18 @@ void loop()
         int s2Out = lookupInterpolate(s2Travel);
         int s4Out = lookupInterpolate(s4Travel);
 
-        // Write to DAC channels
-        dacWrite(DAC_CH_A, travelToS2Dac(s2Out));
-        dacWrite(DAC_CH_B, travelToS4Dac(s4Out));
+        // Write to PWM output channels
+        OCR1A = travelToS2Ocr(s2Out);
+        OCR1B = travelToS4Ocr(s4Out);
     }
 
-    // -- 200 ms: print filtered sensor values to serial monitor --------------
+    // -- 200 ms: print filtered pulse widths to serial monitor ---------------
     if (now - lastSerialMs >= 200UL) {
         lastSerialMs = now;
         Serial.print(F("S2: "));
         Serial.print((int)s2Filtered);
-        Serial.print(F("  S4: "));
-        Serial.println((int)s4Filtered);
+        Serial.print(F(" us  S4: "));
+        Serial.print((int)s4Filtered);
+        Serial.println(F(" us"));
     }
 }
